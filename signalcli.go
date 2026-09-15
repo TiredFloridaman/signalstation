@@ -150,8 +150,59 @@ func (c *CLI) command(ctx context.Context, args ...string) *exec.Cmd {
 	if c.JavaHome != "" {
 		cmd.Env = append(cmd.Env, "JAVA_HOME="+c.JavaHome)
 	}
+
+	// Corral signal-cli's temp files into a directory we control and can sweep.
+	//
+	// signal-cli bundles libsignal as a native library, and every invocation
+	// unpacks a fresh copy to the temp directory when the JVM (or the native
+	// build) loads it. When the process is killed rather than exiting cleanly —
+	// which the short, timeout-bounded keep-online receives routinely are — that
+	// copy is orphaned. Pointed at the system temp folder and run every few
+	// minutes, this accumulates into gigabytes of leaked libsignal copies.
+	//
+	// Overriding TMP/TEMP (used by the native build and cmd.exe) and
+	// java.io.tmpdir (used by the JVM) puts every extraction under one managed
+	// directory. sweepSignalTemp then clears it, so leaked copies never build up.
+	tmp := signalTempDir()
+	_ = os.MkdirAll(tmp, 0o700)
+	cmd.Env = append(cmd.Env, "TMP="+tmp, "TEMP="+tmp)
+	if java, _, ok := c.javaLaunch(); ok && cmd.Path == java {
+		// Insert the tmpdir property immediately after the java executable and
+		// before -classpath, since JVM options must precede the main class and
+		// its arguments. cmd.Args is [java, -classpath, CP, MainClass, args…];
+		// splitting -classpath from CP would break the launch.
+		rest := append([]string{"-Djava.io.tmpdir=" + tmp}, cmd.Args[1:]...)
+		cmd.Args = append([]string{cmd.Args[0]}, rest...)
+	}
+
 	hideConsole(cmd)
 	return cmd
+}
+
+// signalTempDir is the managed temp directory for signal-cli's native
+// extractions, kept inside our own app data so it is easy to find and safe to
+// wipe.
+func signalTempDir() string {
+	return filepath.Join(appDataDir(), "signal-cli-temp")
+}
+
+// sweepSignalTemp deletes leaked libsignal extractions. It runs at startup and
+// after each background receive. It only ever touches our own managed temp
+// directory, never the system temp folder.
+func sweepSignalTemp() {
+	dir := signalTempDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		// Leave anything modified in the last minute alone, in case a receive is
+		// genuinely mid-flight and still using it.
+		if info, err := e.Info(); err == nil && time.Since(info.ModTime()) < time.Minute {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+	}
 }
 
 // run executes signal-cli and returns stdout+stderr together. signal-cli writes

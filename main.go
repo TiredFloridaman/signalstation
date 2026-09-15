@@ -90,6 +90,11 @@ func main() {
 
 	s := &Station{fyneApp: a, win: w, store: store}
 	s.cli = NewCLI(store.Config())
+
+	// Clear any libsignal temp copies leaked by earlier runs before doing
+	// anything else, so they do not accumulate across sessions.
+	sweepSignalTemp()
+
 	s.buildUI()
 	s.refreshAll()
 	s.startKeepOnline()
@@ -203,6 +208,10 @@ func (s *Station) startKeepOnline() {
 				_ = s.cli.Receive(runCtx, acct.Number, 8*time.Second)
 				cancelRun()
 			}
+			// The receives above are the main source of leaked libsignal temp
+			// copies, so clean up right after each cycle rather than only at
+			// startup.
+			sweepSignalTemp()
 		}
 	}()
 }
