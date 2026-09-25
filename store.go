@@ -55,8 +55,13 @@ type Config struct {
 	KeepOnline    bool   `json:"keep_online"`
 	// DisableScreenSecurity, when true (the default), writes contentProtection
 	// off in each profile so the linking QR is screen-readable on Windows 11.
-	DisableScreenSecurity *bool      `json:"disable_screen_security,omitempty"`
-	Accounts              []*Account `json:"accounts"`
+	DisableScreenSecurity *bool `json:"disable_screen_security,omitempty"`
+	// ExportEnabled turns on the daily message export. ExportDir is the folder
+	// daily bundles are written to; empty means a default under the app data
+	// folder.
+	ExportEnabled bool       `json:"export_enabled"`
+	ExportDir     string     `json:"export_dir,omitempty"`
+	Accounts      []*Account `json:"accounts"`
 }
 
 type Store struct {
@@ -154,6 +159,14 @@ func (s *Store) SetKeepOnline(v bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cfg.KeepOnline = v
+	return s.save()
+}
+
+func (s *Store) SetExport(enabled bool, dir string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.ExportEnabled = enabled
+	s.cfg.ExportDir = strings.TrimSpace(dir)
 	return s.save()
 }
 

@@ -214,8 +214,11 @@ go mod tidy && go run .
 
 1. **Add account** — give it a name and a phone number in `+` international form.
 2. The app requests a code. When Signal demands a captcha, it opens the captcha
-   page for you. Solve it, then **right-click "Open Signal" and copy the link
-   address** — do not click it. Paste that into the app.
+   page for you. Solve it, then **click the "Open Signal" link** — Signal Station
+   registers itself as the handler for those links, so the token comes straight
+   back and registration continues on its own. (If clicking does nothing because
+   the handler is not registered, right-click the link, copy the link address,
+   and paste it into the app instead.)
 3. Enter the code that arrives by SMS. If the number cannot receive SMS, there
    is a **Call me with the code instead** button.
 4. **Link Signal Desktop.** The app opens a Signal Desktop window with a fresh
@@ -263,6 +266,13 @@ Desktop's own profile is, so treat that folder as sensitive.
 The log redacts verification codes, captcha tokens, and PINs, so it is safe to
 attach to a bug report.
 
+**Screen security.** By default, Signal Station disables Signal's screen-capture
+protection in the profiles it manages, so it can read the linking QR code on
+Windows 11. If you would rather keep that protection on and link by phone camera
+instead, turn off "Disable Signal's screen-capture protection" in Settings. It
+only ever affects profiles Signal Station creates, and you can change it per
+profile from inside Signal afterwards.
+
 **Removing an account** from Signal Station does not unregister the number with
 Signal. To give a number up entirely:
 
@@ -272,17 +282,125 @@ signal-cli --config <data dir> -a +1555... unregister
 
 ---
 
-## Keeping accounts online
+## Staying connected (persistent per-account daemons)
 
-Signal expects a primary device to check in regularly. Because `signal-cli` is
-the primary here and only runs when invoked, nothing fetches messages between
-actions, and linked Signal Desktop windows drift out of sync.
+While Signal Station is open, each registered or linked account holds its own
+**long-lived `signal-cli` connection** — one `signal-cli -a <number> jsonRpc`
+process per account, started when the app opens and kept running. Each connects
+to Signal once and **streams messages in real time** as they arrive, rather than
+the app polling every few minutes.
 
-**Settings › Keep accounts online in the background** polls each registered
-account every few minutes to fix that. Leave it on if you use these accounts
-regularly.
+This is what keeps accounts online, and it feeds the daily export instantly. It
+also means `libsignal` is unpacked once per process instead of on every poll, so
+the temp-file churn is gone. If a connection drops, it is restarted
+automatically with backoff. When you close Signal Station, every connection is
+shut down.
+
+**Settings › Keep accounts online in the background** is the on/off switch for
+these connections (the export also turns them on, since it needs the stream).
+With it off, no background connection is held and nothing is received until you
+act manually.
 
 ---
+
+## Daily message export (for an AI agent)
+
+**Settings › Export messages daily for an AI agent** writes one folder per day
+that an AI agent can read to produce daily summaries. Point it at any folder your
+agent watches — for example a synced folder.
+
+Because `signal-cli` is a linked device, it sees both directions: messages you
+**receive** and messages you **send** from your phone (delivered to linked
+devices as sync messages). Both are captured, across every registered account.
+
+Capture is a continuous journal: while export is on, every background receive is
+recorded as it happens, so nothing is missed between builds. Turning export on
+also keeps accounts online, since a steady receive stream is what feeds it.
+
+### How it is laid out
+
+One folder per account, then per day, then per chat — so you can point an agent
+at a single conversation, a single account, or the whole tree.
+
+```
+<export folder>/
+└── Work/                         one folder per account (its label, else number)
+    └── 2026-09-24/               one folder per day
+        ├── index.md             the day's chats at a glance, with links
+        ├── Bob/                  one folder per chat
+        │   ├── messages.json     structured records for this chat
+        │   ├── transcript.md     readable log for this chat
+        │   └── attachments/      this chat's images and files
+        └── Launch Crew/
+            ├── messages.json
+            ├── transcript.md
+            └── attachments/
+```
+
+The account folder is named after the account's label (set when you add it),
+falling back to its phone number. Each chat folder is named after the contact or
+group; a chat is one folder even though messages flow both ways.
+
+`messages.json` is the machine-readable feed for that chat. Each message carries
+`direction` (`sent`/`received`), the local `time`, a stable `conversation_id`,
+the sender (`from`, plus `from_number` and `from_uuid` where known), and for
+each attachment a relative `file` path into that chat's `attachments/`.
+`transcript.md` embeds images inline so a multimodal agent sees them. `index.md`
+summarises the account's day and links to each chat.
+
+### Group chats and senders
+
+Group chats are exported like any other conversation — one folder per group —
+and every message shows **who sent it**, which matters when several people are
+talking. The sender is the person's Signal profile name; when they haven't
+shared one, it falls back to their phone number, and failing that a short label
+from their account id, so a sender is never blank. (signal-cli's message data
+does not include Signal @usernames, so the profile name is the closest available
+identifier; the raw number and account id are in `messages.json` for exact
+matching.)
+
+Signal's received-message data usually omits the group's name and carries only
+its id. Signal Station resolves real names separately via `signal-cli
+listGroups`, caches them, and names each group folder accordingly — so you get
+`Q4 Planning/` rather than `Group aBcD1234/`. A brand-new group may show the id
+placeholder until the next background refresh fills its name in, after which the
+next rebuild renames the folder.
+
+### How it builds
+
+- **Continuously**: messages are journaled as they arrive.
+- **At startup**: any past day that was never built (the app was closed at
+  midnight) is assembled, and today is (re)built.
+- **Every 30 minutes**: today's bundle is refreshed as more arrives.
+- **On demand**: **Settings › Export now** builds today immediately.
+
+The journal lives in the app data folder; only the finished daily bundles go to
+your chosen folder. Capture begins when you enable it — earlier history is not
+available, because signal-cli only receives messages sent while it is linked.
+
+### Handing it to an agent
+
+Point your agent at whatever scope you want summarised: one chat's folder, an
+account's day folder (read `index.md`, then each chat's `transcript.md`), or the
+whole tree. A prompt as simple as *"summarise each chat's transcript.md under
+today's folder and flag anything needing a reply"* works; for structured
+processing, parse the per-chat `messages.json` files.
+
+---
+
+## Captcha links
+
+Signal's captcha page finishes with an "Open Signal" link whose address is
+`signalcaptcha://<token>`. Signal Station registers itself as the handler for
+that scheme — on Windows via a per-user registry key written at first launch, on
+macOS via a `CFBundleURLTypes` entry in the app bundle — so clicking the link
+hands the token directly to the app. No copy-paste.
+
+If a second copy of Signal Station is launched by the click, it detects the
+already-running instance, passes the token to it through a small file in the data
+folder, and exits, so you never get a duplicate window. The manual paste box is
+always there as a fallback, which matters when running as a bare executable
+(no bundle or registry entry) or if a browser refuses to open custom schemes.
 
 ## Troubleshooting
 
@@ -301,22 +419,21 @@ rm ./*\(*\).go                                  # macOS / Linux
 The folder needs exactly one copy of each `.go` file. Cloning the repo, or
 downloading it as a zip and extracting it, avoids this entirely.
 
-**Windows 11: the QR code is never found** — this is expected and cannot be
-fixed. Signal Desktop sets a DRM flag on its own windows by default on Windows
-11, to keep chats out of Microsoft Recall. That flag blocks every screen-capture
-API, so the window is simply absent from any screenshot. The setting lives at
-Signal Settings → Privacy → Screen security, which you cannot reach before the
-app is linked, and there is no command-line switch for it.
+**Linking reads the QR code off the screen automatically, on every platform.**
+Signal Station opens the Signal Desktop window, scans for the QR, and approves
+it. Leave the window visible and unobstructed while it works. On macOS, grant
+Screen Recording permission the first time (System Settings → Privacy & Security
+→ Screen Recording), then quit and reopen Signal Station.
 
-Use a phone camera instead. It reads the code optically, straight off the glass,
-so the capture protection is irrelevant. The camera offers a link starting with
-`sgnl://`; send that text to yourself and paste it into the linking dialog. This
-does exactly what automatic capture would have done. On Windows the dialog leads
-with the paste box for this reason.
-
-**Elsewhere: "Could not find the QR code on screen"** — the Signal Desktop window
-was covered, minimised, or on a display that failed to capture. Bring it to the
-front, unobstructed, and try again, or use the phone-camera method above.
+**If the scan finds nothing, a paste box takes over.** This is the expected path
+when Signal's Windows 11 screen-capture protection is active for that install:
+the window is excluded from capture, so the scan sees blank where the QR is.
+Point your phone camera at the code, and it offers a link starting with
+`sgnl://` — paste that into the box that appears and linking continues. Signal
+Station also writes `contentProtection: false` into each profile it creates
+before first launch, which on many Windows setups is enough to keep the window
+capturable and let the scan succeed; when Signal overrides that, the paste box
+is the reliable fallback.
 
 **Windows: "is not recognized as an internal or external command, operable
 program or batch file"** — a Signal linking URI contains an `&`. Run through
@@ -330,6 +447,15 @@ in use; you want "native executable" or "java directly", not "cmd.exe".
 
 If it still says cmd.exe, no JVM was found. Either set `JAVA_HOME` in Settings,
 or download the `signal-cli.exe` native build, which needs no Java at all.
+
+There is a subtler version of this trap worth knowing about. signal-cli ships
+`bin/signal-cli` (a shell script) beside `bin/signal-cli.bat`, and pointing at
+the extensionless one looks harmless. Windows resolves it through `PATHEXT` to
+the `.bat` and `CreateProcess` runs batch files by spawning `cmd.exe` internally
+— so a shell parses the arguments even though nothing asked for one, and the URI
+is truncated at its first `&`. Signal Station now resolves the extension itself
+before deciding how to launch, and refuses outright to send an argument
+containing `&` through a shell rather than transmitting a corrupted one.
 
 **"Authentication failed" when linking** — `signal-cli` is not the primary
 device for that number. This happens if the number was registered elsewhere.
@@ -363,6 +489,10 @@ store.go         account model and atomic JSON persistence
 signalcli.go     signal-cli wrapper and error translation
 desktop.go       Signal Desktop discovery and per-profile launch
 qrscan.go        screen capture and QR decoding
+protocol.go      registers the signalcaptcha:// URL scheme handler
+captcha_ipc.go   delivers a clicked captcha link to the running instance
+export.go        journals messages and builds the daily export bundles
+screensecurity.go writes Signal's contentProtection flag so the QR is readable
 theme.go         colour and type scale
 widgets.go       tappable row container
 exec_windows.go  hides console windows

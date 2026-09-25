@@ -209,6 +209,15 @@ func sweepSignalTemp() {
 // most of what we care about (including error detail) to stderr, so the two are
 // merged deliberately.
 func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
+	return c.runCore(ctx, false, args...)
+}
+
+// runCore executes signal-cli. When quiet is true, the command's output is not
+// written verbatim to the log — only a byte count and any error. This is used
+// for the JSON receive, whose output is the actual message stream (bodies and
+// all); mirroring it into the debug log would needlessly duplicate private
+// message content on disk.
+func (c *CLI) runCore(ctx context.Context, quiet bool, args ...string) (string, error) {
 	if !c.Available() {
 		return "", errors.New("signal-cli was not found. Set its location in Settings")
 	}
@@ -235,7 +244,16 @@ func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 
 	err := cmd.Run()
 	out := buf.String()
-	appendLog(shown, out, err)
+	if quiet {
+		summary := fmt.Sprintf("«%d bytes of message JSON, not logged»", len(out))
+		if err != nil {
+			// On error, the tail often holds the reason and is not message data.
+			summary = lastMeaningfulLine(out)
+		}
+		appendLog(shown, summary, err)
+	} else {
+		appendLog(shown, out, err)
+	}
 
 	if err != nil {
 		if ctx.Err() != nil {
@@ -410,6 +428,35 @@ func (c *CLI) SendContacts(ctx context.Context, number string) error {
 func (c *CLI) Receive(ctx context.Context, number string, timeout time.Duration) error {
 	_, err := c.run(ctx, "-a", number, "receive", "-t", fmt.Sprintf("%.0f", timeout.Seconds()))
 	return err
+}
+
+// ReceiveJSON drains pending messages and returns signal-cli's JSON output, one
+// object per line, for the export journal to parse. --output=json is a global
+// flag and must precede the receive subcommand. Attachments are downloaded into
+// the config directory as a side effect, which is what lets the export copy
+// images out later.
+func (c *CLI) ReceiveJSON(ctx context.Context, number string, timeout time.Duration) (string, error) {
+	return c.runCore(ctx, true, "--output=json", "-a", number, "receive", "-t",
+		fmt.Sprintf("%.0f", timeout.Seconds()))
+}
+
+// ListGroupsJSON returns the account's groups as a JSON array, used to resolve
+// group names for the export (receive JSON carries only the group id). It reads
+// local state and does not hit the network.
+func (c *CLI) ListGroupsJSON(ctx context.Context, number string) (string, error) {
+	return c.runCore(ctx, true, "--output=json", "-a", number, "listGroups")
+}
+
+// jsonRPCCommand builds the long-lived `signal-cli -a NUMBER jsonRpc` process.
+// It streams received messages as JSON-RPC notifications on stdout and accepts
+// requests on stdin. The caller wires the pipes and manages its lifetime; the
+// context kills the process when cancelled. Reuses command() so the launch
+// method (native exe, java, or cmd.exe) and the managed temp dir are applied.
+func (c *CLI) jsonRPCCommand(ctx context.Context, number string) (*exec.Cmd, error) {
+	if !c.Available() {
+		return nil, errors.New("signal-cli was not found. Set its location in Settings")
+	}
+	return c.command(ctx, "-a", number, "jsonRpc"), nil
 }
 
 func (c *CLI) ListAccounts(ctx context.Context) (string, error) {

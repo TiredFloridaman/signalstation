@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"runtime"
 	"time"
@@ -32,21 +33,65 @@ func (s *Station) showSettings() {
 	keepOnline.SetChecked(cfg.KeepOnline)
 
 	screenSec := widget.NewCheck(
-		"Disable Signal's screen-capture protection (needed to auto-read the QR code)", nil)
+		"Auto-read the QR code by screen capture where supported", nil)
 	screenSec.SetChecked(s.store.ScreenSecurityDisabled())
 	screenSecHelp := widget.NewLabel(
-		"On Windows 11, Signal Desktop blocks screen capture by default, which stops Signal " +
-			"Station from reading the linking QR code. With this on, Signal Station turns that " +
-			"protection off in each profile it creates so linking can be automatic. It applies " +
-			"to profiles Signal Station manages; you can still toggle it inside Signal at any " +
-			"time under Settings, Privacy, Screen security.")
+		"On macOS and Linux, Signal Station reads the linking QR code straight off the screen. " +
+			"On Windows 11 this cannot work — Signal hides its window from all screen capture to " +
+			"keep chats out of Microsoft Recall, and that is enforced by the system — so Windows " +
+			"always uses the phone-camera paste method instead, regardless of this setting.")
 	screenSecHelp.Wrapping = fyne.TextWrapWord
 
 	keepHelp := widget.NewLabel(
-		"Signal expects a primary device to check in regularly. With this on, Signal Station " +
-			"fetches messages for each registered account every few minutes so linked Signal " +
-			"Desktop windows stay in sync.")
+		"With this on, Signal Station holds a live signal-cli connection for each account the " +
+			"whole time it is open, receiving messages in real time so linked Signal Desktop " +
+			"windows stay in sync. With it off, no background connection is held. The daily " +
+			"export also turns this on, since it needs the message stream.")
 	keepHelp.Wrapping = fyne.TextWrapWord
+
+	// --- Daily message export ---
+	exportOn := widget.NewCheck("Export messages daily for an AI agent", nil)
+	exportOn.SetChecked(cfg.ExportEnabled)
+
+	exportDir := widget.NewEntry()
+	exportDir.SetText(cfg.ExportDir)
+	exportDir.SetPlaceHolder("Folder for daily bundles (leave blank for the app data folder)")
+
+	exportHelp := widget.NewLabel(
+		"Writes one folder per day containing messages.json (structured), transcript.md " +
+			"(readable), and an attachments folder with every image — for both messages you " +
+			"receive and messages you send from your phone. Point this at a folder your agent " +
+			"watches. Turning this on also keeps accounts online so messages are captured.")
+	exportHelp.Wrapping = fyne.TextWrapWord
+
+	exportStatus := widget.NewLabel("")
+	exportStatus.Wrapping = fyne.TextWrapWord
+
+	exportNow := widget.NewButton("Export now", func() {
+		// Persist current export settings first so the build uses them.
+		if err := s.store.SetExport(true, exportDir.Text); err != nil {
+			s.showError(err)
+			return
+		}
+		exportOn.SetChecked(true)
+		exportStatus.SetText("Building today's bundle…")
+		go func() {
+			cfg := s.store.Config()
+			day := time.Now().Local().Format("2006-01-02")
+			dir, n, err := BuildDailyBundle(cfg, day)
+			fyne.Do(func() {
+				if err != nil {
+					exportStatus.SetText("Export failed: " + err.Error())
+					return
+				}
+				exportStatus.SetText(fmt.Sprintf("Exported %d messages for %s to:\n%s", n, day, dir))
+			})
+		}()
+	})
+
+	openExport := widget.NewButton("Open export folder", func() {
+		openInFileManager(exportBundleRoot(s.store.Config()))
+	})
 
 	version := widget.NewLabel("")
 	version.Wrapping = fyne.TextWrapWord
@@ -99,6 +144,20 @@ func (s *Station) showSettings() {
 		keepOnline,
 		keepHelp,
 		widget.NewSeparator(),
+		exportOn,
+		container.NewBorder(nil, nil, nil,
+			widget.NewButton("Browse", func() {
+				dialog.ShowFolderOpen(func(u fyne.ListableURI, err error) {
+					if err != nil || u == nil {
+						return
+					}
+					exportDir.SetText(u.Path())
+				}, s.win)
+			}), exportDir),
+		exportHelp,
+		container.NewHBox(exportNow, openExport),
+		exportStatus,
+		widget.NewSeparator(),
 		screenSec,
 		screenSecHelp,
 		widget.NewSeparator(),
@@ -123,8 +182,13 @@ func (s *Station) showSettings() {
 				s.showError(err)
 				return
 			}
+			if err := s.store.SetExport(exportOn.Checked, exportDir.Text); err != nil {
+				s.showError(err)
+				return
+			}
 			s.cli = NewCLI(s.store.Config())
-			s.startKeepOnline()
+			s.reconcileDaemons()
+			s.startDailyExport()
 			s.refreshAll()
 		}, s.win)
 	d.Resize(fyne.NewSize(680, 560))

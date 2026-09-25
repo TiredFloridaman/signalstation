@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -30,8 +31,18 @@ type Station struct {
 	statusBar *widget.Label
 	banner    *fyne.Container
 
-	keepCancel    context.CancelFunc
 	captchaCancel context.CancelFunc
+	exportCancel  context.CancelFunc
+
+	// Persistent per-account signal-cli daemons. While Signal Station runs, each
+	// registered/linked account has its own long-lived `signal-cli jsonRpc`
+	// process streaming messages in real time. daemonRoot is cancelled on close
+	// to stop them all; daemons maps account number -> its handle.
+	daemonRoot context.Context
+	daemonStop context.CancelFunc
+	daemonMu   sync.Mutex
+	daemons    map[string]*daemonHandle
+	daemonReq  int64
 
 	// captchaPending, when set, is a registration waiting for a captcha token.
 	// A token arriving from the browser (or a manual paste) is routed here so
@@ -97,7 +108,8 @@ func main() {
 
 	s.buildUI()
 	s.refreshAll()
-	s.startKeepOnline()
+	s.startDaemonSupervisor()
+	s.startDailyExport()
 
 	// Register as the signalcaptcha:// handler (idempotent), and start watching
 	// for tokens delivered by browser launches.
@@ -107,8 +119,9 @@ func main() {
 	s.startCaptchaWatch()
 
 	w.SetCloseIntercept(func() {
-		if s.keepCancel != nil {
-			s.keepCancel()
+		s.stopDaemonSupervisor()
+		if s.exportCancel != nil {
+			s.exportCancel()
 		}
 		s.stopCaptchaWatch()
 		w.Close()
@@ -172,27 +185,68 @@ func (s *Station) openURL(raw string) {
 	}
 }
 
-// startKeepOnline periodically drains messages for every registered account.
+// startDaemonSupervisor starts the persistent per-account daemons and a slow
+// reconcile loop that keeps the running set matched to the account list (so a
+// newly linked account gets a daemon, and a removed one is stopped) without
+// having to instrument every account transition.
 //
-// Signal expects a primary device to come online regularly. Because signal-cli
-// is the primary here and it only runs when invoked, nothing would ever fetch
-// messages between manual actions, and delivery to the linked Signal Desktop
-// profiles degrades. A slow poll keeps each account healthy without hammering
-// the service.
-func (s *Station) startKeepOnline() {
-	if s.keepCancel != nil {
-		s.keepCancel()
-		s.keepCancel = nil
+// This replaces the old poll loop: instead of spawning a short-lived signal-cli
+// every few minutes, each account holds one long-lived `signal-cli jsonRpc`
+// process that receives in real time. That both keeps accounts online and feeds
+// the export instantly, and — because libsignal is extracted once per process
+// rather than on every poll — it stops the temp-file churn too.
+func (s *Station) startDaemonSupervisor() {
+	if s.daemonRoot != nil {
+		return
 	}
-	if !s.store.Config().KeepOnline {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.daemonRoot = ctx
+	s.daemonStop = cancel
+
+	s.reconcileDaemons()
+
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.reconcileDaemons()
+			}
+		}
+	}()
+}
+
+// stopDaemonSupervisor cancels every daemon on shutdown.
+func (s *Station) stopDaemonSupervisor() {
+	if s.daemonStop != nil {
+		s.daemonStop()
+		s.daemonStop = nil
+		s.daemonRoot = nil
+	}
+}
+
+// startDailyExport builds bundles for any completed days that do not yet have
+// one (catching days the app was closed over), rebuilds today, and then rebuilds
+// on a slow timer so the current day's bundle stays current as messages arrive.
+func (s *Station) startDailyExport() {
+	if s.exportCancel != nil {
+		s.exportCancel()
+		s.exportCancel = nil
+	}
+	if !s.store.Config().ExportEnabled {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	s.keepCancel = cancel
+	// Build immediately at startup so a returning user finds yesterday ready.
+	go buildPendingBundles(s.store.Config())
 
+	ctx, cancel := context.WithCancel(context.Background())
+	s.exportCancel = cancel
 	go func() {
-		ticker := time.NewTicker(4 * time.Minute)
+		ticker := time.NewTicker(30 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
@@ -200,18 +254,9 @@ func (s *Station) startKeepOnline() {
 				return
 			case <-ticker.C:
 			}
-			for _, acct := range s.store.Accounts() {
-				if acct.Stage != StageRegistered && acct.Stage != StageLinked {
-					continue
-				}
-				runCtx, cancelRun := context.WithTimeout(ctx, 45*time.Second)
-				_ = s.cli.Receive(runCtx, acct.Number, 8*time.Second)
-				cancelRun()
+			if s.store.Config().ExportEnabled {
+				buildPendingBundles(s.store.Config())
 			}
-			// The receives above are the main source of leaked libsignal temp
-			// copies, so clean up right after each cycle rather than only at
-			// startup.
-			sweepSignalTemp()
 		}
 	}()
 }
